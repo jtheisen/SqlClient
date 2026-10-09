@@ -1,0 +1,92 @@
+name: UTF-8 parameter validation
+
+on:
+  push:
+    branches:
+      - dev/automation/utf8-baseline-validation
+      - dev/automation/utf8-fixed-validation
+
+permissions:
+  contents: read
+
+concurrency:
+  group: utf8-parameter-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sql-server-regression:
+    if: github.repository == 'jtheisen/SqlClient'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      VALIDATION_EXPECTATION: ${{ github.ref_name == 'dev/automation/utf8-baseline-validation' && 'baseline' || 'fixed' }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.401'
+
+      - name: Restore repository tools
+        run: dotnet tool restore
+
+      - name: Generate temporary database credential
+        shell: bash
+        run: |
+          SQL_TEST_PASSWORD="Aa1!$(openssl rand -hex 24)"
+          echo "::add-mask::$SQL_TEST_PASSWORD"
+          echo "SQL_TEST_PASSWORD=$SQL_TEST_PASSWORD" >> "$GITHUB_ENV"
+
+      - name: Start SQL Server 2022 Developer
+        shell: bash
+        run: |
+          export MSSQL_SA_PASSWORD="$SQL_TEST_PASSWORD"
+          docker run --detach --name utf8-sql \
+            --publish 127.0.0.1:1433:1433 \
+            --env ACCEPT_EULA=Y --env MSSQL_PID=Developer \
+            --env MSSQL_SA_PASSWORD \
+            mcr.microsoft.com/mssql/server:2022-latest
+          export SQLCMDPASSWORD="$SQL_TEST_PASSWORD"
+          for attempt in $(seq 1 60); do
+            if docker exec --env SQLCMDPASSWORD utf8-sql \
+              /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -C -b \
+              -Q 'SELECT @@VERSION' >/dev/null 2>&1; then
+              echo 'SQL Server is ready.'
+              exit 0
+            fi
+            sleep 2
+          done
+          echo '::error::SQL Server did not become ready within two minutes.'
+          exit 1
+
+      - name: Configure focused database tests
+        shell: bash
+        run: |
+          echo "TEST_MDS_CONFIG=$RUNNER_TEMP/utf8-validation.json" >> "$GITHUB_ENV"
+          TEST_MDS_CONFIG="$RUNNER_TEMP/utf8-validation.json" python3 tools/utf8-validation/configure.py
+
+      - name: Run six database regression cases and verify their outcomes
+        shell: bash
+        run: |
+          set +e
+          dotnet test src/Microsoft.Data.SqlClient/tests/ManualTests/Microsoft.Data.SqlClient.ManualTests.csproj \
+            --framework net10.0 --configuration Debug \
+            --filter 'FullyQualifiedName~Utf8ParameterTests.VarCharUtf8ByteBoundaryRoundTrip' \
+            --results-directory "$RUNNER_TEMP/utf8-results" \
+            --logger 'trx;LogFileName=utf8.trx' \
+            --logger 'console;verbosity=minimal'
+          test_exit=$?
+          set -e
+          python3 tools/utf8-validation/verify_results.py \
+            --trx "$RUNNER_TEMP/utf8-results/utf8.trx" \
+            --expect "$VALIDATION_EXPECTATION" --exit-code "$test_exit"
+
+      - name: Remove temporary server and configuration
+        if: always()
+        shell: bash
+        run: |
+          docker rm --force utf8-sql >/dev/null 2>&1 || true
+          rm -f "$RUNNER_TEMP/utf8-validation.json"
